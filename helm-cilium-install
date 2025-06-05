@@ -1,14 +1,37 @@
 #!/bin/bash
 
+set -euo pipefail
+
 echo "🚀 Starting Helm and Cilium setup on Minikube..."
 
-# Check Helm version
+# 🧪 Check dependencies
+for cmd in helm kubectl minikube; do
+  if ! command -v $cmd &>/dev/null; then
+    echo "❌ Required command '$cmd' not found. Please install it first."
+    exit 1
+  fi
+done
+
+# 🛠️ Install Helm if not already installed
+if ! command -v helm &>/dev/null; then
+  echo "📥 Helm not found. Installing Helm..."
+  curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+  sudo apt-get install apt-transport-https --yes
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/helm.gpg] https://baltocdn.com/helm/stable/debian/ all main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+  sudo apt-get update
+  sudo apt-get install helm -y
+else
+  echo "✅ Helm is already installed. Skipping installation."
+fi
+
+# ✅ Helm version
 helm version
 
 echo "📍 Setting kubectl context to Minikube..."
 kubectl config use-context minikube
 
-echo "🔄 Updating Helm repositories..."
+echo "🔄 Adding and updating Helm repositories..."
+helm repo add cilium https://helm.cilium.io 2>/dev/null || echo "ℹ️ Cilium repo already exists."
 helm repo update
 
 echo "🗑️ Attempting to delete kube-proxy DaemonSet..."
@@ -18,40 +41,42 @@ else
   echo "ℹ️ kube-proxy DaemonSet not found. Skipping deletion."
 fi
 
-echo "📦 Attempting to install Cilium with strict eBPF mode..."
+echo "📦 Installing or upgrading Cilium with strict eBPF mode..."
 
-helm install cilium cilium/cilium --version 1.17.4 \
+IP=$(minikube ip)
+INSTALL_CMD=$(helm install cilium cilium/cilium \
+  --version 1.17.4 \
   --namespace kube-system \
   --set kubeProxyReplacement=true \
   --set enableReplacement=true \
-  --set k8sServiceHost=$(minikube ip) \
+  --set k8sServiceHost="${IP}" \
   --set k8sServicePort=8443 \
-  --set kubeProxyReplacementHealthzBindAddr=" " 2>/dev/null
+  --set operator.replicas=1 \
+  --set kubeProxyReplacementHealthzBindAddr=" " 2>&1)
 
-# If the above install fails, check if it's because it's already installed
-if [ $? -ne 0 ]; then
-  echo "⚠️ Helm install failed. Checking if release 'cilium' already exists..."
-  if helm list -n kube-system | grep -q cilium; then
-    echo "🔄 Cilium release already exists. Attempting upgrade instead..."
-    helm upgrade cilium cilium/cilium --version 1.17.4 \
-      --namespace kube-system \
-      --reuse-values \
-      --set kubeProxyReplacement=true \
-      --set enableReplacement=true \
-      --set k8sServiceHost=$(minikube ip) \
-      --set k8sServicePort=8443 \
-      --set kubeProxyReplacementHealthzBindAddr=" "
-  else
-    echo "❌ Helm install failed for an unknown reason. Exiting."
-    exit 1
-  fi
+if echo "$INSTALL_CMD" | grep -q "cannot re-use a name that is still in use"; then
+  echo "🔄 Cilium already installed. Upgrading instead..."
+  helm upgrade cilium cilium/cilium \
+    --version 1.17.4 \
+    --namespace kube-system \
+    --reuse-values \
+    --set kubeProxyReplacement=true \
+    --set enableReplacement=true \
+    --set k8sServiceHost="${IP}" \
+    --set k8sServicePort=8443 \
+    --set operator.replicas=1 \
+    --set kubeProxyReplacementHealthzBindAddr=" "
+elif echo "$INSTALL_CMD" | grep -q "Error"; then
+  echo "❌ Helm install failed: $INSTALL_CMD"
+  exit 1
 fi
 
-echo "🔁 Waiting 10 seconds for Cilium to settle..."
+echo "⏳ Waiting 10 seconds for Cilium to settle..."
 sleep 10
 
-echo "⚙️ Upgrading Cilium with Hubble enabled..."
-helm upgrade cilium cilium/cilium --version 1.17.4 \
+echo "⚙️ Enabling Hubble components..."
+helm upgrade cilium cilium/cilium \
+  --version 1.17.4 \
   --namespace kube-system \
   --reuse-values \
   --set hubble.relay.enabled=true \
@@ -60,5 +85,11 @@ helm upgrade cilium cilium/cilium --version 1.17.4 \
 echo "🔍 Getting Cilium pods status..."
 kubectl -n kube-system get pods -l k8s-app=cilium
 
-echo "🔎 Checking Cilium status (with wait)..."
-cilium status --wait
+echo "🔎 Checking Cilium status (with wait, max 60 seconds)..."
+
+if timeout 60s cilium status --wait; then
+  echo "✅ Cilium status check completed successfully."
+else
+  echo "⚠️ Cilium status check timed out after 60 seconds."
+  echo "ℹ️ You can manually check later using: cilium status"
+fi
