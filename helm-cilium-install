@@ -1,0 +1,64 @@
+#!/bin/bash
+
+echo "🚀 Starting Helm and Cilium setup on Minikube..."
+
+# Check Helm version
+helm version
+
+echo "📍 Setting kubectl context to Minikube..."
+kubectl config use-context minikube
+
+echo "🔄 Updating Helm repositories..."
+helm repo update
+
+echo "🗑️ Attempting to delete kube-proxy DaemonSet..."
+if kubectl get daemonset kube-proxy -n kube-system &>/dev/null; then
+  kubectl delete daemonset kube-proxy -n kube-system
+else
+  echo "ℹ️ kube-proxy DaemonSet not found. Skipping deletion."
+fi
+
+echo "📦 Attempting to install Cilium with strict eBPF mode..."
+
+helm install cilium cilium/cilium --version 1.17.4 \
+  --namespace kube-system \
+  --set kubeProxyReplacement=true \
+  --set enableReplacement=true \
+  --set k8sServiceHost=$(minikube ip) \
+  --set k8sServicePort=8443 \
+  --set kubeProxyReplacementHealthzBindAddr=" " 2>/dev/null
+
+# If the above install fails, check if it's because it's already installed
+if [ $? -ne 0 ]; then
+  echo "⚠️ Helm install failed. Checking if release 'cilium' already exists..."
+  if helm list -n kube-system | grep -q cilium; then
+    echo "🔄 Cilium release already exists. Attempting upgrade instead..."
+    helm upgrade cilium cilium/cilium --version 1.17.4 \
+      --namespace kube-system \
+      --reuse-values \
+      --set kubeProxyReplacement=true \
+      --set enableReplacement=true \
+      --set k8sServiceHost=$(minikube ip) \
+      --set k8sServicePort=8443 \
+      --set kubeProxyReplacementHealthzBindAddr=" "
+  else
+    echo "❌ Helm install failed for an unknown reason. Exiting."
+    exit 1
+  fi
+fi
+
+echo "🔁 Waiting 10 seconds for Cilium to settle..."
+sleep 10
+
+echo "⚙️ Upgrading Cilium with Hubble enabled..."
+helm upgrade cilium cilium/cilium --version 1.17.4 \
+  --namespace kube-system \
+  --reuse-values \
+  --set hubble.relay.enabled=true \
+  --set hubble.ui.enabled=true
+
+echo "🔍 Getting Cilium pods status..."
+kubectl -n kube-system get pods -l k8s-app=cilium
+
+echo "🔎 Checking Cilium status (with wait)..."
+cilium status --wait
